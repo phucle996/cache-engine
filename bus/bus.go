@@ -37,12 +37,16 @@ import (
 	goredis "github.com/redis/go-redis/v9"
 )
 
-// allowedOps là tập hợp các giá trị Op hợp lệ được chấp nhận.
-// Mọi Op nằm ngoài danh sách này sẽ bị từ chối tại Publish và bị silent drop tại Subscribe.
 var allowedOps = map[string]struct{}{
 	"upsert": {},
 	"delete": {},
 }
+
+var (
+	jsonMarshal      = json.Marshal
+	subscribeBackoff = 1 * time.Second
+	maxBackoff       = 30 * time.Second
+)
 
 // FanoutMessage là phong bì dữ liệu (envelope) được gửi qua kênh Pub/Sub để hủy bỏ cache.
 type FanoutMessage struct {
@@ -100,7 +104,7 @@ func (b *Bus) Publish(ctx context.Context, key string, op string, payload []byte
 		Payload: payload,
 	}
 
-	data, err := json.Marshal(msg)
+	data, err := jsonMarshal(msg)
 	if err != nil {
 		return err
 	}
@@ -112,7 +116,7 @@ func (b *Bus) Publish(ctx context.Context, key string, op string, payload []byte
 // Trong trường hợp mất kết nối mạng hoặc Redis bị khởi động lại, hàm sẽ tự động thử lại (reconnect)
 // với cơ chế exponential backoff (từ 1 giây đến tối đa 30 giây) cho đến khi Context bị hủy.
 func (b *Bus) Subscribe(ctx context.Context, handler func(msg FanoutMessage)) error {
-	backoff := 1 * time.Second
+	backoff := subscribeBackoff
 	for {
 		_ = b.subscribeOnce(ctx, handler)
 		if ctx.Err() != nil {
@@ -125,8 +129,8 @@ func (b *Bus) Subscribe(ctx context.Context, handler func(msg FanoutMessage)) er
 			return ctx.Err()
 		case <-time.After(backoff):
 			backoff *= 2
-			if backoff > 30*time.Second {
-				backoff = 30 * time.Second
+			if backoff > maxBackoff {
+				backoff = maxBackoff
 			}
 		}
 	}

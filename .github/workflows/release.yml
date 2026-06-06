@@ -25,6 +25,15 @@ jobs:
       - name: Run unit tests
         run: go test -v ./...
 
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@v0.28.0
+        with:
+          scan-type: 'fs'
+          ignore-unfixed: true
+          format: 'table'
+          exit-code: '1'
+          severity: 'CRITICAL,HIGH'
+
   release:
     name: Create GitHub Release
     needs: test
