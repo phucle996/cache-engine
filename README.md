@@ -1,6 +1,6 @@
 # Cache Engine
 
-Bộ thư viện Go Cache hai lớp chuyên biệt (**L1 Copy-On-Write RAM** và **L2 Distributed Redis**). Thiết kế tối ưu cho môi trường **Cloud-Native**, **khả dụng cao (HA)**, bảo vệ hệ thống khỏi race condition và cung cấp dữ liệu phân tích vận hành (**telemetry taxonomy**) chi tiết.
+Bộ thư viện Go Cache hai lớp chuyên biệt (**L1 Copy-On-Write RAM** và **L2 Distributed Redis**). Thiết kế tối ưu cho môi trường **Cloud-Native**, **khả dụng cao (HA)**, bảo vệ hệ thống khỏi race condition, cạn kiệt tài nguyên (OOM), sập cơ sở dữ liệu (Cache Stampede) và cung cấp dữ liệu phân tích vận hành (**telemetry taxonomy**) chi tiết.
 
 ---
 
@@ -14,7 +14,20 @@ Thư viện tuân thủ nghiêm ngặt nguyên tắc **Decoupled Architecture** 
 
 ---
 
-## 📌 Yêu Cầu Bắt Buộc: Cấu Hình Cache Key (`keys.json`)
+## 📦 Hệ thống Namespace Tránh Trùng Lặp (Go Modules)
+
+Để đảm bảo an toàn tuyệt đối khi tích hợp vào các dự án lớn, tất cả các package con của thư viện đã được đặt namespace riêng biệt nhằm tránh xung đột với các package gốc (ví dụ: `redis`, `local`, `bus`):
+
+- `cacheEngine_local`: Quản lý L1 RAM Cache (Copy-On-Write).
+- `cacheEngine_redis`: Quản lý L2 Distributed Cache (Redis).
+- `cacheEngine_bus`: Quản lý Invalidation Bus (Redis Pub/Sub).
+- `cacheEngine_registry`: Quản lý cấu hình tĩnh $O(1)$ prefix-slicing map.
+- `cacheEngine_taxonomy`: Quản lý mã lỗi và mã kết quả đo lường (telemetry).
+- `cacheEngine_jitter`: Quản lý tính toán phân phối TTL ngẫu nhiên.
+
+---
+
+## 📌 Cấu Hình Cache Key (`keys.json`)
 
 Để sử dụng bất kỳ Manager nào, **bắt buộc phải khai báo cấu hình key và TTL tương ứng dưới dạng file JSON**. Thư viện sẽ từ chối thao tác (trả về lỗi `BYPASS` kèm mã lỗi `UNREGISTERED_KEY`) đối với các key chưa được đăng ký.
 
@@ -31,7 +44,28 @@ Ví dụ file `keys.json`:
 ]
 ```
 
-*Lưu ý*: Đối với key động, hệ thống sử dụng thuật toán so khớp wildcard kết hợp **LRU Cache** (giới hạn tối đa 10,000 bản ghi) để phân giải nhanh TTL trên hot-path ($O(1)$) nhằm tránh rò rỉ bộ nhớ (OOM) trong môi trường HA.
+*Lưu ý*: Đối với key động, hệ thống sử dụng thuật toán **Prefix-slicing $O(1)$ fast-path** cho các suffix wildcard (dạng `prefix:*`). Các pattern phức tạp sẽ tự động chuyển sang LRU Cache (giới hạn tối đa 10,000 bản ghi) để phân giải nhanh TTL trên hot-path mà không tốn dung lượng RAM.
+
+---
+
+## 🔥 Tính Năng Nâng Cao (Enterprise-Grade Features)
+
+### 1. Singleflight (Chống Nát Database & Quá Tải Mạng)
+
+Phương thức `GetOrLoad` trên cả L1 và L2 giúp bao bọc lời gọi DB/Redis bên trong một `singleflight.Group`.
+
+- Khi xảy ra Cache Miss dưới tải cao, **chỉ có duy nhất 1 goroutine thực sự truy vấn Database/Redis**, các request đồng thời khác sẽ xếp hàng chờ và dùng chung kết quả trả về, chặn đứng thảm họa Cache Breakdown.
+
+### 2. Active L1 Memory Janitor (Bộ Dọn Dẹp RAM Chủ Động)
+
+- **Vấn đề**: Các key hết hạn trong L1 RAM nếu không được gọi `Get` lại sẽ nằm lì trong map gây phình RAM (Memory Bloat).
+
+- **Giải pháp**: Một luồng quét định kỳ chạy ngầm thực hiện Copy-On-Write để xóa hẳn các key hết hạn, giúp GC của Go có thể thu hồi 100% RAM vật lý.
+- **Tối ưu Zero-Allocation**: Janitor sẽ đếm số key hết hạn trước. Nếu bằng `0`, nó sẽ thoát sớm và không thực hiện Copy map, tiết kiệm tối đa CPU/RAM.
+
+### 3. Self-Healing Invalidation Bus (Tự Động Kết Nối Lại)
+
+- Kênh truyền `Subscribe` của `cacheEngine_bus` được trang bị cơ chế **Exponential Backoff Reconnect** tự phục hồi. Nếu kết nối Redis bị gián đoạn, Bus sẽ tự động kết nối lại (thử lại từ 1s tăng dần đến tối đa 30s) mà không gây crash ứng dụng.
 
 ---
 
@@ -39,156 +73,114 @@ Ví dụ file `keys.json`:
 
 ### 1. Chỉ Sử Dụng L1 (Local RAM Cache Only)
 
-Phù hợp cho các service chạy độc lập (single instance) hoặc dữ liệu tĩnh rất ít thay đổi, không yêu cầu đồng bộ tức thời giữa các replica. Không cần kết nối Redis.
+```go
+// Khởi tạo L1 (Mặc định chạy Janitor dọn dẹp RAM mỗi 5 phút)
+localSyncMgr, err := cacheengine.InitLocalEngine("keys.json")
 
-- **Khởi tạo**:
+// Bạn có thể tùy chỉnh thời gian chạy Janitor hoặc tắt khi shutdown:
+localSyncMgr.StartJanitor(10 * time.Minute)
+defer localSyncMgr.Close()
+```
 
-  ```go
-  localSyncMgr, err := cacheengine.InitLocalEngine("keys.json")
-  ```
+#### Sử dụng Singleflight bảo vệ DB
 
-- **Đọc/Ghi**: Sử dụng trực tiếp
-
-  ```go
-  localSyncMgr.GetL1(ctx, key)
-  localSyncMgr.SetL1(ctx, key, val, version)
-  localSyncMgr.InvalidateL1(ctx, key, version)
-  ```
+```go
+val, err := localSyncMgr.GetOrLoad(ctx, "user:profile:123", func() (any, int64, error) {
+    // Chỉ chạy đúng 1 lần cho nhiều request đồng thời khi cache bị Miss
+    user, version, err := db.LoadUser("123")
+    return user, version, err
+})
+```
 
 ---
 
 ### 2. Chỉ Sử Dụng L2 (Distributed Redis Cache Only)
 
-Phù hợp khi RAM của service bị giới hạn, hoặc cần dùng chung bộ đệm tập trung giữa nhiều instance để tránh lãng phí dung lượng RAM cục bộ.
+```go
+redisSyncMgr, err := cacheengine.InitRedisEngine(rdb, "keys.json")
+```
 
-- **Khởi tạo**:
+#### Sử dụng Singleflight bảo vệ mạng Redis
 
-  ```go
-  redisSyncMgr, err := cacheengine.InitRedisEngine(rdb, "keys.json")
-  ```
-
-- **Đọc/Ghi**: Sử dụng trực tiếp
-
-  ```go
-  redisSyncMgr.GetL2(ctx, key)
-  redisSyncMgr.SetL2(ctx, key, valBytes)
-  redisSyncMgr.InvalidateL2(ctx, key)
-  ```
+```go
+valBytes, err := redisSyncMgr.GetOrLoad(ctx, "user:profile:123", func() ([]byte, error) {
+    userBytes, err := db.LoadRawBytes("123")
+    return userBytes, err
+})
+```
 
 ---
 
 ### 3. L1 + Fanout Bus (Đồng Bộ RAM Cục Bộ HA - Không dùng L2)
 
-Phù hợp cho hệ thống cần tốc độ đọc tối đa từ RAM cục bộ trên môi trường HA (nhiều replicas), và đồng bộ hóa trực tiếp các bản sao L1 bằng cách phát tin nhắn qua Redis Pub/Sub mà không cần lưu trữ dữ liệu tại L2 Redis.
+```go
+localSyncMgr, err := cacheengine.InitLocalEngine("keys.json")
+defer localSyncMgr.Close()
 
-- **Khởi tạo**:
+// Khởi tạo Invalidation Bus (Giới hạn payload 1MB tránh OOM)
+fanoutBus := cacheEngine_bus.NewBus(rdb, "invalidation-channel", localSyncMgr.KeyRegistry(), 0)
+```
 
-  ```go
-  localSyncMgr, err := cacheengine.InitLocalEngine("keys.json")
-  fanoutBus := cacheEngine_bus.NewBus(rdb, "invalidation-channel", localSyncMgr.KeyRegistry(), 0) // 0 → dùng DefaultMaxMessageBytes (1 MB)
-  ```
+#### Vòng lặp lắng nghe ở Background (Tự phục hồi kết nối)
 
-- **Vòng lặp lắng nghe ở Background (Subscribe)**:
-
-  ```go
-  go func() {
-      _ = fanoutBus.Subscribe(ctx, func(msg cacheEngine_bus.FanoutMessage) {
-          if msg.Op == "upsert" {
-              var data ConcreteType
-              if err := json.Unmarshal(msg.Payload, &data); err == nil {
-                  _ = localSyncMgr.SetL1(ctx, msg.Key, data, msg.Version)
-              }
-          } else if msg.Op == "delete" {
-              _, _, _ = localSyncMgr.InvalidateL1(ctx, msg.Key, msg.Version)
-          }
-      })
-  }()
-  ```
-
-- **Đọc dữ liệu (L1 -> DB)**:
-
-  ```go
-  val, _, _, outcome := localSyncMgr.GetL1(ctx, key)
-  if outcome == cacheEngine_taxonomy.OutcomeL1Hit {
-      return val.(ConcreteType)
-  }
-  // Miss -> Load từ DB, ghi lại vào L1
-  dbVal, version := loadFromDB(key)
-  _ = localSyncMgr.SetL1(ctx, key, dbVal, version)
-  ```
-
-- **Ghi dữ liệu (Write-Through / Write-Aside)**:
-
-  ```go
-  // 1. Lưu DB
-  // 2. Lưu L1 local
-  _ = localSyncMgr.SetL1(ctx, key, newVal, newVersion)
-  // 3. Chủ động phát tán tin nhắn để các replica khác cập nhật
-  rawBytes, _ := json.Marshal(newVal)
-  _ = fanoutBus.Publish(ctx, key, "upsert", rawBytes, newVersion)
-  ```
+```go
+go func() {
+    // Tự động kết nối lại nếu rớt mạng Redis
+    _ = fanoutBus.Subscribe(ctx, func(msg cacheEngine_bus.FanoutMessage) {
+        if msg.Op == "upsert" {
+            var data UserProfile
+            if err := json.Unmarshal(msg.Payload, &data); err == nil {
+                _ = localSyncMgr.SetL1(ctx, msg.Key, data, msg.Version)
+            }
+        } else if msg.Op == "delete" {
+            _, _, _ = localSyncMgr.InvalidateL1(ctx, msg.Key, msg.Version)
+        }
+    })
+}()
+```
 
 ---
 
 ### 4. Chế Độ Lai Ghép Đầy Đủ (Hybrid Mode: L1 + L2 + Fanout Bus)
 
-Mô hình tối ưu nhất cho hệ thống HA quy mô lớn: Đọc nhanh từ L1 RAM cục bộ, fallback về L2 Redis nếu L1 Miss, và chỉ đọc DB khi cả hai lớp đều Miss. Các cập nhật/xóa được đồng bộ toàn bộ replica thông qua Fanout Bus.
-
-#### Ví dụ luồng Đọc (Cache-aside kết hợp L1/L2)
+#### Luồng Đọc phối hợp Singleflight (L1 -> L2 -> DB)
 
 ```go
-func GetUserProfile(ctx context.Context, localSyncMgr *cacheEngine_local.LocalSyncManager, redisSyncMgr *cacheEngine_redis.RedisSyncManager, userID string) (*UserProfile, error) {
- key := fmt.Sprintf("user:profile:%s", userID)
+func GetUserProfileHybrid(ctx context.Context, localSyncMgr *cacheEngine_local.LocalSyncManager, redisSyncMgr *cacheEngine_redis.RedisSyncManager, userID string) (*UserProfile, error) {
+    key := fmt.Sprintf("user:profile:%s", userID)
 
- // 1. Đọc dữ liệu từ L1 Cache (RAM local)
- val, err, errx, outcome := localSyncMgr.GetL1(ctx, key)
- if outcome == cacheEngine_taxonomy.OutcomeL1Hit {
-  profile := val.(UserProfile)
-  return &profile, nil
- }
+    // 1. Đọc nhanh từ L1, nếu Miss sẽ dùng Singleflight gom nhóm request
+    val, err := localSyncMgr.GetOrLoad(ctx, key, func() (any, int64, error) {
+        // --- ĐOẠN CODE NÀY CHỈ CHẠY 1 LẦN CHO CÁC REQUEST ĐỒNG THỜI BỊ L1 MISS ---
 
- // 2. Nếu L1 Miss -> Đọc dữ liệu thô từ L2 Cache (Redis)
- valBytes, err, errx, outcomeL2 := redisSyncMgr.GetL2(ctx, key)
- if outcomeL2 == cacheEngine_taxonomy.OutcomeL2Hit {
-  var profile UserProfile
-  if err := json.Unmarshal(valBytes, &profile); err == nil {
-   // Ghi ngược lại L1 dạng struct cụ thể (tránh JSON overhead cho lần sau)
-   _, _, _ = localSyncMgr.SetL1(ctx, key, profile, time.Now().UnixNano())
-   return &profile, nil
-  }
- }
+        // 2. Thử lấy từ L2 Cache (Redis)
+        valBytes, err, _, outcomeL2 := redisSyncMgr.GetL2(ctx, key)
+        if outcomeL2 == cacheEngine_taxonomy.OutcomeL2Hit {
+            var profile UserProfile
+            if err := json.Unmarshal(valBytes, &profile); err == nil {
+                return profile, time.Now().UnixNano(), nil
+            }
+        }
 
- // 3. Cache Miss cả hai lớp -> Load dữ liệu từ DB (SoT)
- dbUser := UserProfile{ID: userID, Name: "Phuc Le", Email: "phucle@example.com"}
- dbVersion := time.Now().UnixNano()
+        // 3. L2 Miss -> Load DB thực tế
+        profile, version, dbErr := db.LoadUserProfile(userID)
+        if dbErr != nil {
+            return nil, 0, dbErr
+        }
 
- // 4. Ghi ngược lại cache L2 dạng bytes và L1 dạng struct
- rawBytes, _ := json.Marshal(dbUser)
- _, _, _ = redisSyncMgr.SetL2(ctx, key, rawBytes)
- _, _, _ = localSyncMgr.SetL1(ctx, key, dbUser, dbVersion)
+        // 4. Ghi ngược lại L2 Redis
+        rawBytes, _ := json.Marshal(profile)
+        _ = redisSyncMgr.SetL2(ctx, key, rawBytes)
 
- return &dbUser, nil
-}
-```
+        return profile, version, nil
+    })
 
-#### Ví dụ luồng Ghi & Quyết định Fanout (Hook tại Callsite)
+    if err != nil {
+        return nil, err
+    }
 
-```go
-func UpdateUserProfile(ctx context.Context, localSyncMgr *cacheEngine_local.LocalSyncManager, redisSyncMgr *cacheEngine_redis.RedisSyncManager, fanoutBus *cacheEngine_bus.Bus, profile UserProfile) error {
- key := fmt.Sprintf("user:profile:%s", profile.ID)
- dbVersion := time.Now().UnixNano()
-
- // 1. Cập nhật dữ liệu vào DB
- // db.Save(&profile)
-
- // 2. Cập nhật cache L2 thô và L1 của chính instance hiện tại
- rawBytes, _ := json.Marshal(profile)
- _ = redisSyncMgr.SetL2(ctx, key, rawBytes)
- _, _, _ = localSyncMgr.SetL1(ctx, key, profile, dbVersion)
-
- // 3. Tùy chọn: Gọi hook phát tán (Fanout) sang các replica L1 khác trong cụm HA
- err := fanoutBus.Publish(ctx, key, "upsert", rawBytes, dbVersion)
- return err
+    profile := val.(UserProfile)
+    return &profile, nil
 }
 ```
 
@@ -196,7 +188,7 @@ func UpdateUserProfile(ctx context.Context, localSyncMgr *cacheEngine_local.Loca
 
 ## 🧪 Chạy Unit Test
 
-Chạy bộ unit test để xác thực tính toàn vẹn của logic so khớp wildcard, LRU cache, kiểm soát stale version monotonic, và các outcome đo lường:
+Chạy bộ unit test để xác thực tính toàn vẹn của logic so khớp wildcard, LRU cache, kiểm soát stale version monotonic, Singleflight và Active Janitor:
 
 ```bash
 go test -v ./...
