@@ -1,24 +1,25 @@
-package cacheEngine_registry
+package cacheEngine_test
 
 import (
+	cacheEngine_registry "cache-engine/registry"
 	"testing"
 	"time"
 )
 
 func TestKeyRegistry_PrefixFastPath(t *testing.T) {
-	r := NewKeyRegistry(10)
+	r := cacheEngine_registry.NewKeyRegistry(10)
 
 	// Register a suffix wildcard
 	r.Register("user:profile:*", 10*time.Minute)
 
 	// Verify it went to prefixKeys map
-	if ttl, ok := r.prefixKeys["user:profile:"]; !ok || ttl != 10*time.Minute {
+	if ttl, ok := r.HasPrefix("user:profile:"); !ok || ttl != 10*time.Minute {
 		t.Errorf("expected user:profile: in prefixKeys map, got %v, ok=%v", ttl, ok)
 	}
 
 	// Verify length was recorded
 	foundLen := false
-	for _, l := range r.prefixLengths {
+	for _, l := range r.PrefixLengths() {
 		if l == len("user:profile:") {
 			foundLen = true
 			break
@@ -35,24 +36,24 @@ func TestKeyRegistry_PrefixFastPath(t *testing.T) {
 	}
 
 	// Verify it did NOT enter LRU cache (since it is a prefix fast-path key)
-	if r.lru.evictList.Len() != 0 {
-		t.Errorf("expected LRU cache length to be 0, got %d", r.lru.evictList.Len())
+	if r.LRULen() != 0 {
+		t.Errorf("expected LRU cache length to be 0, got %d", r.LRULen())
 	}
 }
 
 func TestKeyRegistry_ComplexWildcardLRU(t *testing.T) {
 	// LRU Capacity = 2
-	r := NewKeyRegistry(2)
+	r := cacheEngine_registry.NewKeyRegistry(2)
 
 	// Register a complex wildcard (wildcard in the middle)
 	r.Register("device:*:status", 5*time.Minute)
 
 	// Verify it went to patterns slice, not prefixKeys
-	if len(r.patterns) != 1 || r.patterns[0].pattern != "device:*:status" {
-		t.Errorf("expected patterns slice to contain device:*:status")
+	if r.PatternsCount() != 1 {
+		t.Errorf("expected patterns slice to contain 1 entry, got %d", r.PatternsCount())
 	}
-	if len(r.prefixKeys) != 0 {
-		t.Errorf("expected prefixKeys map to be empty, got %d", len(r.prefixKeys))
+	if _, ok := r.HasPrefix("device:"); ok {
+		t.Errorf("expected prefixKeys map to be empty, but it resolved device:")
 	}
 
 	// Resolve 1st key -> should enter LRU
@@ -60,8 +61,8 @@ func TestKeyRegistry_ComplexWildcardLRU(t *testing.T) {
 	if !exists || ttl != 5*time.Minute {
 		t.Errorf("expected 5m TTL, got %v", ttl)
 	}
-	if r.lru.evictList.Len() != 1 {
-		t.Errorf("expected LRU len 1, got %d", r.lru.evictList.Len())
+	if r.LRULen() != 1 {
+		t.Errorf("expected LRU len 1, got %d", r.LRULen())
 	}
 
 	// Resolve 2nd key -> should enter LRU
@@ -69,8 +70,8 @@ func TestKeyRegistry_ComplexWildcardLRU(t *testing.T) {
 	if !exists || ttl != 5*time.Minute {
 		t.Errorf("expected 5m TTL, got %v", ttl)
 	}
-	if r.lru.evictList.Len() != 2 {
-		t.Errorf("expected LRU len 2, got %d", r.lru.evictList.Len())
+	if r.LRULen() != 2 {
+		t.Errorf("expected LRU len 2, got %d", r.LRULen())
 	}
 
 	// Resolve 3rd key -> should cause LRU eviction of device:1:status
@@ -78,19 +79,19 @@ func TestKeyRegistry_ComplexWildcardLRU(t *testing.T) {
 	if !exists || ttl != 5*time.Minute {
 		t.Errorf("expected 5m TTL, got %v", ttl)
 	}
-	if r.lru.evictList.Len() != 2 {
-		t.Errorf("expected LRU len to stay capped at 2, got %d", r.lru.evictList.Len())
+	if r.LRULen() != 2 {
+		t.Errorf("expected LRU len to stay capped at 2, got %d", r.LRULen())
 	}
 
 	// Check that device:1:status was indeed evicted
-	if _, exists := r.lru.items["device:1:status"]; exists {
+	if r.LRUHas("device:1:status") {
 		t.Errorf("expected device:1:status to be evicted from LRU map")
 	}
 	// Check that device:2:status and device:3:status are still in LRU
-	if _, exists := r.lru.items["device:2:status"]; !exists {
+	if !r.LRUHas("device:2:status") {
 		t.Errorf("expected device:2:status to be in LRU map")
 	}
-	if _, exists := r.lru.items["device:3:status"]; !exists {
+	if !r.LRUHas("device:3:status") {
 		t.Errorf("expected device:3:status to be in LRU map")
 	}
 }

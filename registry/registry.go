@@ -165,6 +165,45 @@ func (r *KeyRegistry) evictOldest() {
 	}
 }
 
+// HasPrefix trả về true và TTL nếu prefix đã được đăng ký trong prefix map.
+func (r *KeyRegistry) HasPrefix(prefix string) (time.Duration, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	ttl, exists := r.prefixKeys[prefix]
+	return ttl, exists
+}
+
+// PrefixLengths trả về bản sao danh sách độ dài các prefix.
+func (r *KeyRegistry) PrefixLengths() []int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	lengths := make([]int, len(r.prefixLengths))
+	copy(lengths, r.prefixLengths)
+	return lengths
+}
+
+// PatternsCount trả về số lượng dynamic patterns phức tạp được đăng ký.
+func (r *KeyRegistry) PatternsCount() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(r.patterns)
+}
+
+// LRULen trả về số lượng phần tử hiện tại trong LRU Cache.
+func (r *KeyRegistry) LRULen() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.lru.evictList.Len()
+}
+
+// LRUHas trả về true nếu key đang tồn tại trong LRU Cache.
+func (r *KeyRegistry) LRUHas(key string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	_, exists := r.lru.items[key]
+	return exists
+}
+
 func parseSuffixWildcard(pattern string) (string, bool) {
 	// Phải chứa đúng 1 dấu '*' ở cuối cùng và không chứa các ký tự wildcard khác '?', '['
 	for i := 0; i < len(pattern); i++ {

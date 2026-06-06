@@ -1,4 +1,4 @@
-package cacheengine_test
+package cacheEngine_test
 
 import (
 	"context"
@@ -440,7 +440,3 @@ func TestRedisSyncManager_GetOrLoadObject(t *testing.T) {
 		t.Errorf("expected dbCalls = 1, got %d", dbCalls)
 	}
 }
-
-
-
-
