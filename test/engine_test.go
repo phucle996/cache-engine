@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -239,3 +241,134 @@ func TestBus_PublishTTLFromRegistry(t *testing.T) {
 		t.Error("expected error/panic due to nil redis client, got nil")
 	}
 }
+
+func TestLocalSyncManager_GetOrLoad_Singleflight(t *testing.T) {
+	l1Mock := NewMockL1()
+	syncMgr := cacheEngine_local.NewLocalSyncManager(l1Mock)
+	syncMgr.RegisterKeyConfig("user:profile:*", 5*time.Minute)
+
+	ctx := context.Background()
+	var callCount int64
+
+	// Tạo 20 goroutines gọi GetOrLoad đồng thời
+	const concurrency = 20
+	var wg sync.WaitGroup
+	wg.Add(concurrency)
+
+	results := make([]any, concurrency)
+	errors := make([]error, concurrency)
+
+	for i := 0; i < concurrency; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			val, err := syncMgr.GetOrLoad(ctx, "user:profile:123", func() (any, int64, error) {
+				// Tăng counter
+				atomic.AddInt64(&callCount, 1)
+				// Giả lập độ trễ truy vấn DB
+				time.Sleep(50 * time.Millisecond)
+				return "DB_DATA", 999, nil
+			})
+			results[idx] = val
+			errors[idx] = err
+		}(i)
+	}
+
+	wg.Wait()
+
+	// 1. Kiểm tra số lần gọi thực sự xuống loadFn
+	if callCount != 1 {
+		t.Errorf("expected loadFn to be called exactly 1 time, got %d times", callCount)
+	}
+
+	// 2. Tất cả các goroutine phải nhận được cùng một dữ liệu và không bị lỗi
+	for i := 0; i < concurrency; i++ {
+		if errors[i] != nil {
+			t.Errorf("goroutine %d returned error: %v", i, errors[i])
+		}
+		if results[i] != "DB_DATA" {
+			t.Errorf("goroutine %d expected 'DB_DATA', got %v", i, results[i])
+		}
+	}
+}
+
+func TestRedisSyncManager_GetOrLoad_Singleflight(t *testing.T) {
+	// Khởi tạo RedisSyncManager với l2 = nil
+	syncMgr := cacheEngine_redis.NewRedisSyncManager(nil)
+	syncMgr.RegisterKeyConfig("user:profile:*", 5*time.Minute)
+
+	ctx := context.Background()
+	var callCount int64
+
+	const concurrency = 20
+	var wg sync.WaitGroup
+	wg.Add(concurrency)
+
+	results := make([][]byte, concurrency)
+	errors := make([]error, concurrency)
+
+	for i := 0; i < concurrency; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			val, err := syncMgr.GetOrLoad(ctx, "user:profile:123", func() ([]byte, error) {
+				atomic.AddInt64(&callCount, 1)
+				time.Sleep(50 * time.Millisecond)
+				return []byte("REDIS_DATA"), nil
+			})
+			results[idx] = val
+			errors[idx] = err
+		}(i)
+	}
+
+	wg.Wait()
+
+	if callCount != 1 {
+		t.Errorf("expected loadFn to be called exactly 1 time, got %d times", callCount)
+	}
+
+	for i := 0; i < concurrency; i++ {
+		if errors[i] != nil {
+			t.Errorf("goroutine %d returned error: %v", i, errors[i])
+		}
+		if string(results[i]) != "REDIS_DATA" {
+			t.Errorf("goroutine %d expected 'REDIS_DATA', got %s", i, string(results[i]))
+		}
+	}
+}
+
+func TestLocalSyncManager_Janitor_Eviction(t *testing.T) {
+	l1Cache := cacheEngine_local.NewCOWCache()
+	syncMgr := cacheEngine_local.NewLocalSyncManager(l1Cache)
+	// Đóng janitor mặc định để chạy janitor test với tần suất nhanh (10ms)
+	syncMgr.Close()
+
+	syncMgr.RegisterKeyConfig("temp:*", 10*time.Millisecond)
+	syncMgr.RegisterKeyConfig("persist:*", 1*time.Hour)
+
+	ctx := context.Background()
+
+	// Set 1 key chuẩn bị hết hạn nhanh, và 1 key sống lâu
+	_, _, _ = syncMgr.SetL1(ctx, "temp:1", "value1", 100)
+	_, _, _ = syncMgr.SetL1(ctx, "persist:1", "value2", 100)
+
+	// Bắt đầu janitor quét mỗi 100ms
+	syncMgr.StartJanitor(100 * time.Millisecond)
+	defer syncMgr.Close()
+
+	// Chờ 1100ms để key temp:1 chắc chắn hết hạn (clamped tối thiểu 1s do Jitter)
+	time.Sleep(1100 * time.Millisecond)
+
+	// Kiểm tra xem temp:1 đã biến mất hoàn toàn khỏi cache chưa
+	_, _, ok := l1Cache.Get("temp:1")
+	if ok {
+		t.Error("expected temp:1 to be evicted by janitor, but it still exists")
+	}
+
+	// Key persist:1 vẫn phải còn tồn tại
+	val, _, ok := l1Cache.Get("persist:1")
+	if !ok || val != "value2" {
+		t.Errorf("expected persist:1 to still exist with 'value2', got exist=%v, val=%v", ok, val)
+	}
+}
+
+
+

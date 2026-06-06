@@ -28,6 +28,7 @@ import (
 	cacheEngine_taxonomy "cache-engine/taxonomy"
 
 	goredis "github.com/redis/go-redis/v9"
+	"golang.org/x/sync/singleflight"
 )
 
 // RedisCache là bộ nhớ đệm L2 phân tán sử dụng Redis làm cơ sở dữ liệu lưu trữ.
@@ -76,6 +77,7 @@ func (c *RedisCache) Delete(ctx context.Context, key string) error {
 type RedisSyncManager struct {
 	l2          *RedisCache
 	keyRegistry *cacheEngine_registry.KeyRegistry
+	sfGroup     singleflight.Group
 }
 
 // NewRedisSyncManager tạo mới và khởi tạo thực thể cho RedisSyncManager.
@@ -153,3 +155,42 @@ func (m *RedisSyncManager) InvalidateL2(ctx context.Context, key string) (error,
 
 	return nil, nil, cacheEngine_taxonomy.OutcomeDelete
 }
+
+// GetOrLoad hỗ trợ lấy dữ liệu thô từ L2, nếu miss sẽ dùng Singleflight để gom nhóm các request đồng thời bằng loadFn.
+func (m *RedisSyncManager) GetOrLoad(
+	ctx context.Context,
+	key string,
+	loadFn func() (value []byte, err error),
+) ([]byte, error) {
+	// 1. Kiểm tra L2 Cache trước
+	valBytes, _, _, outcome := m.GetL2(ctx, key)
+	if outcome == cacheEngine_taxonomy.OutcomeL2Hit {
+		return valBytes, nil
+	}
+
+	// 2. Nếu L2 Miss -> Gom nhóm các request đồng thời bằng Singleflight
+	res, err, _ := m.sfGroup.Do(key, func() (any, error) {
+		ttl, exists := m.keyRegistry.Resolve(key)
+		if !exists {
+			// Nếu key chưa đăng ký, vẫn chạy loadFn bình thường nhưng không ghi cache (Bypass)
+			return loadFn()
+		}
+
+		dbValBytes, dbErr := loadFn()
+		if dbErr != nil {
+			return nil, dbErr
+		}
+
+		// Tự động ghi lại cache L2
+		if m.l2 != nil {
+			_ = m.l2.Set(ctx, key, dbValBytes, ttl)
+		}
+		return dbValBytes, nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+	return res.([]byte), nil
+}
+
