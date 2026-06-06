@@ -25,10 +25,10 @@ import (
 	"reflect"
 	"time"
 
-	cacheEngine_codec "cache-engine/codec"
-	cacheEngine_jitter "cache-engine/jitter"
-	cacheEngine_registry "cache-engine/registry"
-	cacheEngine_taxonomy "cache-engine/taxonomy"
+	cacheEngine_codec "github.com/phucle996/cache-engine/codec"
+	cacheEngine_jitter "github.com/phucle996/cache-engine/jitter"
+	cacheEngine_registry "github.com/phucle996/cache-engine/registry"
+	cacheEngine_taxonomy "github.com/phucle996/cache-engine/taxonomy"
 
 	goredis "github.com/redis/go-redis/v9"
 	"golang.org/x/sync/singleflight"

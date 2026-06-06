@@ -23,9 +23,9 @@ HỢP ĐỒNG (CONTRACT), NGUỒN SỰ THẬT (SoT) & RANH GIỚI (BOUNDARIES) -
 */
 
 import (
-	cacheEngine_jitter "cache-engine/jitter"
-	cacheEngine_registry "cache-engine/registry"
-	cacheEngine_taxonomy "cache-engine/taxonomy"
+	cacheEngine_jitter "github.com/phucle996/cache-engine/jitter"
+	cacheEngine_registry "github.com/phucle996/cache-engine/registry"
+	cacheEngine_taxonomy "github.com/phucle996/cache-engine/taxonomy"
 	"context"
 	"sync"
 	"sync/atomic"

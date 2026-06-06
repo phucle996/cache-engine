@@ -27,7 +27,7 @@ import (
 	"context"
 	"time"
 
-	cacheEngine_bus "cache-engine/bus"
+	cacheEngine_bus "github.com/phucle996/cache-engine/bus"
 )
 
 // L1Cache định nghĩa interface cho cache bộ nhớ trong cục bộ (RAM cục bộ).

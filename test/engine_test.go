@@ -10,12 +10,12 @@ import (
 	"testing"
 	"time"
 
-	cacheengine "cache-engine"
-	cacheEngine_bus "cache-engine/bus"
-	cacheEngine_codec "cache-engine/codec"
-	cacheEngine_local "cache-engine/local"
-	cacheEngine_redis "cache-engine/redis"
-	cacheEngine_registry "cache-engine/registry"
+	cacheengine "github.com/phucle996/cache-engine"
+	cacheEngine_bus "github.com/phucle996/cache-engine/bus"
+	cacheEngine_codec "github.com/phucle996/cache-engine/codec"
+	cacheEngine_local "github.com/phucle996/cache-engine/local"
+	cacheEngine_redis "github.com/phucle996/cache-engine/redis"
+	cacheEngine_registry "github.com/phucle996/cache-engine/registry"
 )
 
 // MockL1 implements L1Cache interface.

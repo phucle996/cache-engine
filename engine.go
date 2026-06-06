@@ -24,8 +24,8 @@ import (
 	"os"
 	"time"
 
-	cacheEngine_local "cache-engine/local"
-	cacheEngine_redis "cache-engine/redis"
+	cacheEngine_local "github.com/phucle996/cache-engine/local"
+	cacheEngine_redis "github.com/phucle996/cache-engine/redis"
 
 	goredis "github.com/redis/go-redis/v9"
 )

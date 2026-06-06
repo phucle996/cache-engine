@@ -1,6 +1,6 @@
-module cache-engine
+module github.com/phucle996/cache-engine
 
-go 1.25.0
+go 1.26.0
 
 require (
 	github.com/redis/go-redis/v9 v9.20.0

@@ -1,7 +1,7 @@
 package cacheEngine_test
 
 import (
-	cacheEngine_registry "cache-engine/registry"
+	cacheEngine_registry "github.com/phucle996/cache-engine/registry"
 	"testing"
 	"time"
 )
