@@ -287,3 +287,47 @@ func TestLocalSyncManager_Janitor_Eviction(t *testing.T) {
 		t.Errorf("expected persist:1 to still exist with 'value2', got exist=%v, val=%v", ok, val)
 	}
 }
+
+func TestCOWCache_GetOrLoad(t *testing.T) {
+	c := cacheEngine_local.NewCOWCache()
+	ctx := context.Background()
+
+	// 1. First call: miss, should load and set
+	var calls int
+	val, err := c.GetOrLoad(ctx, "key1", func() (any, int64, error) {
+		calls++
+		return "value1", 100, nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if val != "value1" {
+		t.Errorf("expected value1, got %v", val)
+	}
+	if calls != 1 {
+		t.Errorf("expected 1 call, got %d", calls)
+	}
+
+	// 2. Second call: hit, should return cached
+	val, err = c.GetOrLoad(ctx, "key1", func() (any, int64, error) {
+		calls++
+		return "value2", 101, nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if val != "value1" {
+		t.Errorf("expected cached value1, got %v", val)
+	}
+	if calls != 1 {
+		t.Errorf("expected still 1 call, got %d", calls)
+	}
+
+	// 3. Error case: should forward error and not cache
+	_, err = c.GetOrLoad(ctx, "key2", func() (any, int64, error) {
+		return nil, 0, fmt.Errorf("load error")
+	})
+	if err == nil || err.Error() != "load error" {
+		t.Errorf("expected load error, got %v", err)
+	}
+}

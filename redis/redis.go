@@ -36,12 +36,24 @@ import (
 
 // RedisCache là bộ nhớ đệm L2 phân tán sử dụng Redis làm cơ sở dữ liệu lưu trữ.
 type RedisCache struct {
-	client *goredis.Client
+	client  *goredis.Client
+	sfGroup singleflight.Group
+	codec   cacheEngine_codec.Codec
 }
 
 // NewRedisCache tạo mới thực thể RedisCache.
 func NewRedisCache(client *goredis.Client) *RedisCache {
-	return &RedisCache{client: client}
+	return &RedisCache{
+		client: client,
+		codec:  cacheEngine_codec.NewJSONCodec(),
+	}
+}
+
+// SetCodec thiết lập bộ mã hóa/giải mã cho RedisCache.
+func (c *RedisCache) SetCodec(codec cacheEngine_codec.Codec) {
+	if codec != nil {
+		c.codec = codec
+	}
 }
 
 // Get truy xuất mảng byte thô từ Redis.
@@ -74,6 +86,61 @@ func (c *RedisCache) Delete(ctx context.Context, key string) error {
 		return nil
 	}
 	return c.client.Del(ctx, key).Err()
+}
+
+// GetOrLoad hỗ trợ lấy dữ liệu raw bytes từ L2, tự động nạp khi miss.
+func (c *RedisCache) GetOrLoad(ctx context.Context, key string, loadFn func() ([]byte, error)) ([]byte, error) {
+	val, found, err := c.Get(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	if found {
+		return val, nil
+	}
+
+	res, err, _ := c.sfGroup.Do(key, func() (any, error) {
+		dbVal, dbErr := loadFn()
+		if dbErr != nil {
+			return nil, dbErr
+		}
+
+		_ = c.Set(ctx, key, dbVal, 5*time.Minute)
+		return dbVal, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return res.([]byte), nil
+}
+
+// GetOrLoadObject hỗ trợ lấy đối tượng kiểu struct phức tạp từ L2, tự động nạp khi miss.
+func (c *RedisCache) GetOrLoadObject(ctx context.Context, key string, dest any, loadFn func() (any, error)) error {
+	valBytes, found, err := c.Get(ctx, key)
+	if err != nil {
+		return err
+	}
+	if found {
+		return c.codec.Unmarshal(valBytes, dest)
+	}
+
+	_, err, _ = c.sfGroup.Do(key, func() (any, error) {
+		dbObj, dbErr := loadFn()
+		if dbErr != nil {
+			return nil, dbErr
+		}
+
+		if err := copyValue(dest, dbObj); err != nil {
+			return nil, err
+		}
+
+		serialized, err := c.codec.Marshal(dbObj)
+		if err != nil {
+			return nil, err
+		}
+		_ = c.Set(ctx, key, serialized, 5*time.Minute)
+		return nil, nil
+	})
+	return err
 }
 
 // RedisSyncManager điều phối việc đọc ghi dữ liệu cache L2 (Redis phân tán).

@@ -43,6 +43,9 @@ type L1Cache interface {
 
 	// Clear xóa sạch toàn bộ cache trong RAM cục bộ.
 	Clear()
+
+	// GetOrLoad hỗ trợ lấy dữ liệu từ L1, tự động nạp từ loadFn khi miss.
+	GetOrLoad(ctx context.Context, key string, loadFn func() (value any, version int64, err error)) (any, error)
 }
 
 // L2Cache định nghĩa interface cho cache phân tán (ví dụ: Redis).
@@ -56,6 +59,12 @@ type L2Cache interface {
 
 	// Delete xóa dữ liệu khỏi L2.
 	Delete(ctx context.Context, key string) error
+
+	// GetOrLoad hỗ trợ lấy dữ liệu raw bytes từ L2, tự động nạp khi miss.
+	GetOrLoad(ctx context.Context, key string, loadFn func() ([]byte, error)) ([]byte, error)
+
+	// GetOrLoadObject hỗ trợ lấy đối tượng kiểu struct phức tạp từ L2, tự động nạp khi miss.
+	GetOrLoadObject(ctx context.Context, key string, dest any, loadFn func() (any, error)) error
 }
 
 // FanoutBus định nghĩa interface cho cơ chế phát/đăng ký nhận tin nhắn hủy cache (invalidation).

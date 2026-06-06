@@ -367,3 +367,147 @@ func TestRedisSyncManager_GetOrLoadObject(t *testing.T) {
 		t.Errorf("expected dbCalls = 1, got %d", dbCalls)
 	}
 }
+
+func TestRedisCache_Methods(t *testing.T) {
+	s := miniredis.RunT(t)
+	defer s.Close()
+
+	rdb := goredis.NewClient(&goredis.Options{
+		Addr: s.Addr(),
+	})
+	defer rdb.Close()
+
+	l2 := cacheEngine_redis.NewRedisCache(rdb)
+
+	// 1. Test SetCodec
+	gobCodec := cacheEngine_codec.NewGobCodec()
+	l2.SetCodec(gobCodec)
+	l2.SetCodec(nil)
+
+	ctx := context.Background()
+
+	// 2. Test GetOrLoad
+	var dbCalls int
+	data, err := l2.GetOrLoad(ctx, "raw:key", func() ([]byte, error) {
+		dbCalls++
+		return []byte("db-raw-data"), nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(data) != "db-raw-data" {
+		t.Errorf("expected db-raw-data, got %s", string(data))
+	}
+	if dbCalls != 1 {
+		t.Errorf("expected 1 db call, got %d", dbCalls)
+	}
+
+	data, err = l2.GetOrLoad(ctx, "raw:key", func() ([]byte, error) {
+		dbCalls++
+		return []byte("new-data"), nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(data) != "db-raw-data" {
+		t.Errorf("expected cached db-raw-data, got %s", string(data))
+	}
+	if dbCalls != 1 {
+		t.Errorf("expected still 1 db call, got %d", dbCalls)
+	}
+
+	_, err = l2.GetOrLoad(ctx, "raw:key-err", func() ([]byte, error) {
+		return nil, fmt.Errorf("load raw error")
+	})
+	if err == nil || err.Error() != "load raw error" {
+		t.Errorf("expected load raw error, got %v", err)
+	}
+
+	// 3. Test GetOrLoadObject
+	var dbCallsObj int
+	var u1 TestUser
+	err = l2.GetOrLoadObject(ctx, "obj:key", &u1, func() (any, error) {
+		dbCallsObj++
+		return TestUser{ID: 1, Name: "Alice"}, nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if u1.Name != "Alice" {
+		t.Errorf("expected Alice, got %s", u1.Name)
+	}
+	if dbCallsObj != 1 {
+		t.Errorf("expected 1 db call, got %d", dbCallsObj)
+	}
+
+	var u2 TestUser
+	err = l2.GetOrLoadObject(ctx, "obj:key", &u2, func() (any, error) {
+		dbCallsObj++
+		return TestUser{ID: 2, Name: "Bob"}, nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if u2.Name != "Alice" {
+		t.Errorf("expected cached Alice, got %s", u2.Name)
+	}
+	if dbCallsObj != 1 {
+		t.Errorf("expected still 1 db call, got %d", dbCallsObj)
+	}
+
+	var u3 TestUser
+	err = l2.GetOrLoadObject(ctx, "obj:key-err", &u3, func() (any, error) {
+		return nil, fmt.Errorf("load obj error")
+	})
+	if err == nil || err.Error() != "load obj error" {
+		t.Errorf("expected load obj error, got %v", err)
+	}
+
+	err = l2.GetOrLoadObject(ctx, "obj:key-copy-err", "not-a-pointer", func() (any, error) {
+		return TestUser{ID: 1}, nil
+	})
+	if err == nil {
+		t.Error("expected error due to invalid dest pointer, got nil")
+	}
+
+	// 4. Test Error Paths (Redis Client Closed)
+	rdbErr := goredis.NewClient(&goredis.Options{Addr: s.Addr()})
+	l2Err := cacheEngine_redis.NewRedisCache(rdbErr)
+	_ = rdbErr.Close()
+
+	_, err = l2Err.GetOrLoad(ctx, "key-error", func() ([]byte, error) {
+		return []byte("data"), nil
+	})
+	if err == nil {
+		t.Error("expected error when client is closed in GetOrLoad, got nil")
+	}
+
+	var uErr TestUser
+	err = l2Err.GetOrLoadObject(ctx, "key-error", &uErr, func() (any, error) {
+		return TestUser{ID: 1}, nil
+	})
+	if err == nil {
+		t.Error("expected error when client is closed in GetOrLoadObject, got nil")
+	}
+
+	// 5. Test Unmarshal error in GetOrLoadObject
+	_ = rdb.Set(ctx, "invalid-json-key", "invalid-value", 0).Err()
+	l2JSON := cacheEngine_redis.NewRedisCache(rdb)
+	var uJSON TestUser
+	err = l2JSON.GetOrLoadObject(ctx, "invalid-json-key", &uJSON, func() (any, error) {
+		return TestUser{ID: 1}, nil
+	})
+	if err == nil {
+		t.Error("expected unmarshal error for invalid JSON payload, got nil")
+	}
+
+	// 6. Test Marshal error in GetOrLoadObject
+	l2JSONError := cacheEngine_redis.NewRedisCache(rdb)
+	var chDest chan int
+	err = l2JSONError.GetOrLoadObject(ctx, "marshal-err-key", &chDest, func() (any, error) {
+		return make(chan int), nil
+	})
+	if err == nil {
+		t.Error("expected marshal error for channel type in GetOrLoadObject, got nil")
+	}
+}

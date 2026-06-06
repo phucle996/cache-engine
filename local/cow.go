@@ -46,8 +46,9 @@ type snapshot struct {
 
 // COWCache triển khai bộ nhớ đệm L1 an toàn đa luồng cục bộ bằng cơ chế hoán đổi snapshot Copy-On-Write.
 type COWCache struct {
-	ptr atomic.Pointer[snapshot]
-	mu  sync.Mutex // Đồng bộ hóa các luồng ghi
+	ptr     atomic.Pointer[snapshot]
+	mu      sync.Mutex // Đồng bộ hóa các luồng ghi
+	sfGroup singleflight.Group
 }
 
 // NewCOWCache tạo và khởi tạo thực thể COWCache mới.
@@ -159,12 +160,36 @@ func (c *COWCache) EvictExpired() int {
 	return expiredCount
 }
 
+// GetOrLoad hỗ trợ lấy dữ liệu từ L1, tự động nạp từ loadFn khi miss.
+func (c *COWCache) GetOrLoad(
+	ctx context.Context,
+	key string,
+	loadFn func() (value any, version int64, err error),
+) (any, error) {
+	val, _, ok := c.Get(key)
+	if ok {
+		return val, nil
+	}
+
+	res, err, _ := c.sfGroup.Do(key, func() (any, error) {
+		dbVal, version, dbErr := loadFn()
+		if dbErr != nil {
+			return nil, dbErr
+		}
+
+		c.Set(key, dbVal, 5*time.Minute, version)
+		return dbVal, nil
+	})
+	return res, err
+}
+
 // L1Cache đại diện cho interface của L1 Cache bộ nhớ trong cục bộ.
 type L1Cache interface {
 	Get(key string) (value any, version int64, found bool)
 	Set(key string, value any, ttl time.Duration, version int64)
 	Delete(key string, version int64)
 	Clear()
+	GetOrLoad(ctx context.Context, key string, loadFn func() (value any, version int64, err error)) (any, error)
 }
 
 // LocalSyncManager điều phối việc đọc ghi cache L1 cục bộ (RAM) kèm kiểm soát cấu hình key và phiên bản.

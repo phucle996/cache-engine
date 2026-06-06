@@ -1,6 +1,7 @@
 package cacheEngine_test
 
 import (
+	"context"
 	"encoding/gob"
 	"time"
 )
@@ -37,6 +38,19 @@ func (m *MockL1) Delete(key string, version int64) {
 func (m *MockL1) Clear() {
 	m.data = make(map[string]any)
 	m.version = make(map[string]int64)
+}
+
+func (m *MockL1) GetOrLoad(ctx context.Context, key string, loadFn func() (value any, version int64, err error)) (any, error) {
+	val, _, exists := m.Get(key)
+	if exists {
+		return val, nil
+	}
+	dbVal, version, err := loadFn()
+	if err != nil {
+		return nil, err
+	}
+	m.Set(key, dbVal, 5*time.Minute, version)
+	return dbVal, nil
 }
 
 type TestUser struct {
