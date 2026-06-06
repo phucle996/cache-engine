@@ -343,7 +343,7 @@ func TestLocalSyncManager_Janitor_Eviction(t *testing.T) {
 	// Đóng janitor mặc định để chạy janitor test với tần suất nhanh (10ms)
 	syncMgr.Close()
 
-	syncMgr.RegisterKeyConfig("temp:*", 10*time.Millisecond)
+	syncMgr.RegisterKeyConfig("temp:*", -1*time.Second)
 	syncMgr.RegisterKeyConfig("persist:*", 1*time.Hour)
 
 	ctx := context.Background()
@@ -352,12 +352,12 @@ func TestLocalSyncManager_Janitor_Eviction(t *testing.T) {
 	_, _, _ = syncMgr.SetL1(ctx, "temp:1", "value1", 100)
 	_, _, _ = syncMgr.SetL1(ctx, "persist:1", "value2", 100)
 
-	// Bắt đầu janitor quét mỗi 100ms
-	syncMgr.StartJanitor(100 * time.Millisecond)
+	// Bắt đầu janitor quét mỗi 50ms
+	syncMgr.StartJanitor(50 * time.Millisecond)
 	defer syncMgr.Close()
 
-	// Chờ 1100ms để key temp:1 chắc chắn hết hạn (clamped tối thiểu 1s do Jitter)
-	time.Sleep(1100 * time.Millisecond)
+	// Chờ 200ms để janitor chạy quét qua ít nhất 1 lần
+	time.Sleep(200 * time.Millisecond)
 
 	// Kiểm tra xem temp:1 đã biến mất hoàn toàn khỏi cache chưa
 	_, _, ok := l1Cache.Get("temp:1")
