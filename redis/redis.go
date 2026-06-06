@@ -21,8 +21,11 @@ HỢP ĐỒNG (CONTRACT), NGUỒN SỰ THẬT (SoT) & RANH GIỚI (BOUNDARIES) -
 
 import (
 	"context"
+	"fmt"
+	"reflect"
 	"time"
 
+	cacheEngine_codec "cache-engine/codec"
 	cacheEngine_jitter "cache-engine/jitter"
 	cacheEngine_registry "cache-engine/registry"
 	cacheEngine_taxonomy "cache-engine/taxonomy"
@@ -78,6 +81,7 @@ type RedisSyncManager struct {
 	l2          *RedisCache
 	keyRegistry *cacheEngine_registry.KeyRegistry
 	sfGroup     singleflight.Group
+	codec       cacheEngine_codec.Codec
 }
 
 // NewRedisSyncManager tạo mới và khởi tạo thực thể cho RedisSyncManager.
@@ -85,6 +89,14 @@ func NewRedisSyncManager(l2 *RedisCache) *RedisSyncManager {
 	return &RedisSyncManager{
 		l2:          l2,
 		keyRegistry: cacheEngine_registry.NewKeyRegistry(10000),
+		codec:       cacheEngine_codec.NewJSONCodec(), // Mặc định dùng JSON
+	}
+}
+
+// SetCodec thiết lập bộ mã hóa/giải mã cho manager.
+func (m *RedisSyncManager) SetCodec(codec cacheEngine_codec.Codec) {
+	if codec != nil {
+		m.codec = codec
 	}
 }
 
@@ -193,4 +205,96 @@ func (m *RedisSyncManager) GetOrLoad(
 	}
 	return res.([]byte), nil
 }
+
+// GetL2Object tự động truy xuất và giải tuần tự hóa từ L2 vào dest.
+func (m *RedisSyncManager) GetL2Object(ctx context.Context, key string, dest any) (error, *cacheEngine_taxonomy.Error, cacheEngine_taxonomy.Outcome) {
+	valBytes, err, terr, outcome := m.GetL2(ctx, key)
+	if outcome != cacheEngine_taxonomy.OutcomeL2Hit {
+		return err, terr, outcome
+	}
+	if err := m.codec.Unmarshal(valBytes, dest); err != nil {
+		return err, cacheEngine_taxonomy.NewError(cacheEngine_taxonomy.ErrCodeL2Failed, "failed to unmarshal object", err), cacheEngine_taxonomy.OutcomeFailed
+	}
+	return nil, nil, cacheEngine_taxonomy.OutcomeL2Hit
+}
+
+// SetL2Object tự động tuần tự hóa và cập nhật dữ liệu vào L2.
+func (m *RedisSyncManager) SetL2Object(ctx context.Context, key string, value any) (error, *cacheEngine_taxonomy.Error, cacheEngine_taxonomy.Outcome) {
+	valBytes, err := m.codec.Marshal(value)
+	if err != nil {
+		return err, cacheEngine_taxonomy.NewError(cacheEngine_taxonomy.ErrCodeL2Failed, "failed to marshal object", err), cacheEngine_taxonomy.OutcomeFailed
+	}
+	return m.SetL2(ctx, key, valBytes)
+}
+
+// GetOrLoadObject tự động truy xuất từ L2, nếu miss sẽ dùng Singleflight bao bọc loadFn và tự động ghi cache L2.
+func (m *RedisSyncManager) GetOrLoadObject(
+	ctx context.Context,
+	key string,
+	dest any,
+	loadFn func() (value any, err error),
+) error {
+	// 1. Thử lấy từ L2 trước
+	err, _, outcome := m.GetL2Object(ctx, key, dest)
+	if outcome == cacheEngine_taxonomy.OutcomeL2Hit {
+		return nil
+	}
+
+	// 2. Gom nhóm các request bằng Singleflight
+	res, err, _ := m.sfGroup.Do(key, func() (any, error) {
+		ttl, exists := m.keyRegistry.Resolve(key)
+		if !exists {
+			// Key chưa đăng ký -> Chạy loadFn bình thường nhưng không ghi cache (Bypass)
+			return loadFn()
+		}
+
+		dbVal, dbErr := loadFn()
+		if dbErr != nil {
+			return nil, dbErr
+		}
+
+		// Tự động ghi lại cache L2
+		if m.l2 != nil && dbVal != nil {
+			valBytes, encErr := m.codec.Marshal(dbVal)
+			if encErr == nil {
+				_ = m.l2.Set(ctx, key, valBytes, ttl)
+			}
+		}
+		return dbVal, nil
+	})
+
+	if err != nil {
+		return err
+	}
+
+	// Sao chép kết quả vào dest
+	return copyValue(dest, res)
+}
+
+func copyValue(dest any, src any) error {
+	if src == nil {
+		return nil
+	}
+	vDest := reflect.ValueOf(dest)
+	if vDest.Kind() != reflect.Ptr || vDest.IsNil() {
+		return fmt.Errorf("dest must be a non-nil pointer")
+	}
+
+	vSrc := reflect.ValueOf(src)
+	for vSrc.Kind() == reflect.Ptr || vSrc.Kind() == reflect.Interface {
+		if vSrc.IsNil() {
+			return nil
+		}
+		vSrc = vSrc.Elem()
+	}
+
+	destElem := vDest.Elem()
+	if !vSrc.Type().AssignableTo(destElem.Type()) {
+		return fmt.Errorf("cannot assign %s to %s", vSrc.Type().String(), destElem.Type().String())
+	}
+
+	destElem.Set(vSrc)
+	return nil
+}
+
 

@@ -143,46 +143,47 @@ go func() {
 
 ### 4. Chế Độ Lai Ghép Đầy Đủ (Hybrid Mode: L1 + L2 + Fanout Bus)
 
-#### Luồng Đọc phối hợp Singleflight (L1 -> L2 -> DB)
+#### Tự Động Hóa Qua Object-based Helper & Codec ở L2
+
+`RedisSyncManager` được tích hợp sẵn lớp `codec` (mặc định dùng JSON). Bạn có thể cấu hình sử dụng bộ mã hóa `GobCodec` hoặc `JSONCodec` và gọi trực tiếp các helper dạng Object để tự động giải tuần tự hóa:
 
 ```go
-func GetUserProfileHybrid(ctx context.Context, localSyncMgr *cacheEngine_local.LocalSyncManager, redisSyncMgr *cacheEngine_redis.RedisSyncManager, userID string) (*UserProfile, error) {
+import (
+    cacheEngine_codec "cache-engine/codec"
+)
+
+// 1. Cấu hình Codec Gob nhị phân cho L2 Redis
+redisSyncMgr.SetCodec(cacheEngine_codec.NewGobCodec())
+
+// 2. Đọc lai ghép tại Callsite cực kỳ trực quan:
+func GetUserProfile(ctx context.Context, userID string) (*UserProfile, error) {
     key := fmt.Sprintf("user:profile:%s", userID)
 
-    // 1. Đọc nhanh từ L1, nếu Miss sẽ dùng Singleflight gom nhóm request
-    val, err := localSyncMgr.GetOrLoad(ctx, key, func() (any, int64, error) {
-        // --- ĐOẠN CODE NÀY CHỈ CHẠY 1 LẦN CHO CÁC REQUEST ĐỒNG THỜI BỊ L1 MISS ---
+    // Bước 1: Thử đọc nhanh từ L1 RAM
+    val, _, _, outcome := localSyncMgr.GetL1(ctx, key)
+    if outcome == cacheEngine_taxonomy.OutcomeL1Hit {
+        profile := val.(UserProfile)
+        return &profile, nil
+    }
 
-        // 2. Thử lấy từ L2 Cache (Redis)
-        valBytes, err, _, outcomeL2 := redisSyncMgr.GetL2(ctx, key)
-        if outcomeL2 == cacheEngine_taxonomy.OutcomeL2Hit {
-            var profile UserProfile
-            if err := json.Unmarshal(valBytes, &profile); err == nil {
-                return profile, time.Now().UnixNano(), nil
-            }
-        }
-
-        // 3. L2 Miss -> Load DB thực tế
-        profile, version, dbErr := db.LoadUserProfile(userID)
-        if dbErr != nil {
-            return nil, 0, dbErr
-        }
-
-        // 4. Ghi ngược lại L2 Redis
-        rawBytes, _ := json.Marshal(profile)
-        _ = redisSyncMgr.SetL2(ctx, key, rawBytes)
-
-        return profile, version, nil
+    // Bước 2: L1 Miss -> Đọc từ L2 Redis (Tự động giải tuần tự hóa bằng Gob và bảo vệ bằng Singleflight)
+    var profile UserProfile
+    err := redisSyncMgr.GetOrLoadObject(ctx, key, &profile, func() (any, error) {
+        // DB Fallback - chỉ chạy 1 lần khi Miss cả L1 và L2
+        return db.LoadUserProfileFromDB(userID)
     })
 
     if err != nil {
         return nil, err
     }
 
-    profile := val.(UserProfile)
+    // Bước 3: Ghi ngược lại L1 RAM để lần sau hit luôn ở RAM
+    _, _, _ = localSyncMgr.SetL1(ctx, key, profile, time.Now().UnixNano())
+
     return &profile, nil
 }
 ```
+
 
 ---
 

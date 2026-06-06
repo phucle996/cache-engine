@@ -2,6 +2,7 @@ package cacheengine_test
 
 import (
 	"context"
+	"encoding/gob"
 	"encoding/json"
 	"os"
 	"sync"
@@ -11,6 +12,7 @@ import (
 
 	cacheengine "cache-engine"
 	cacheEngine_bus "cache-engine/bus"
+	cacheEngine_codec "cache-engine/codec"
 	cacheEngine_local "cache-engine/local"
 	cacheEngine_redis "cache-engine/redis"
 	cacheEngine_registry "cache-engine/registry"
@@ -369,6 +371,76 @@ func TestLocalSyncManager_Janitor_Eviction(t *testing.T) {
 		t.Errorf("expected persist:1 to still exist with 'value2', got exist=%v, val=%v", ok, val)
 	}
 }
+
+type TestUser struct {
+	ID   int
+	Name string
+}
+
+func init() {
+	gob.Register(TestUser{})
+}
+
+func TestCodecs(t *testing.T) {
+	user := TestUser{ID: 42, Name: "Alice"}
+
+	// 1. Test JSONCodec
+	jsonCodec := cacheEngine_codec.NewJSONCodec()
+	data, err := jsonCodec.Marshal(user)
+	if err != nil {
+		t.Fatalf("JSON Marshal failed: %v", err)
+	}
+	var decodedJSON TestUser
+	if err := jsonCodec.Unmarshal(data, &decodedJSON); err != nil {
+		t.Fatalf("JSON Unmarshal failed: %v", err)
+	}
+	if decodedJSON != user {
+		t.Errorf("expected %v, got %v", user, decodedJSON)
+	}
+
+	// 2. Test GobCodec
+	gobCodec := cacheEngine_codec.NewGobCodec()
+	dataGob, err := gobCodec.Marshal(user)
+	if err != nil {
+		t.Fatalf("Gob Marshal failed: %v", err)
+	}
+	var decodedGob TestUser
+	if err := gobCodec.Unmarshal(dataGob, &decodedGob); err != nil {
+		t.Fatalf("Gob Unmarshal failed: %v", err)
+	}
+	if decodedGob != user {
+		t.Errorf("expected %v, got %v", user, decodedGob)
+	}
+}
+
+func TestRedisSyncManager_GetOrLoadObject(t *testing.T) {
+	// Khởi tạo RedisSyncManager với l2 = nil (chỉ test qua mock/no L2, fallback xuống DB)
+	redisMgr := cacheEngine_redis.NewRedisSyncManager(nil)
+	redisMgr.RegisterKeyConfig("user:*", 10*time.Minute)
+
+	codec := cacheEngine_codec.NewGobCodec()
+	redisMgr.SetCodec(codec)
+
+	ctx := context.Background()
+	var dbCalls int64
+
+	// Lần đầu: Miss -> Gọi DB
+	var user1 TestUser
+	err := redisMgr.GetOrLoadObject(ctx, "user:123", &user1, func() (any, error) {
+		atomic.AddInt64(&dbCalls, 1)
+		return TestUser{ID: 123, Name: "Bob"}, nil
+	})
+	if err != nil {
+		t.Fatalf("GetOrLoadObject failed: %v", err)
+	}
+	if user1.Name != "Bob" {
+		t.Errorf("expected Bob, got %v", user1.Name)
+	}
+	if dbCalls != 1 {
+		t.Errorf("expected dbCalls = 1, got %d", dbCalls)
+	}
+}
+
 
 
 
